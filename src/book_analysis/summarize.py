@@ -22,6 +22,10 @@ from transformers import pipeline
 
 logger = logging.getLogger(__name__)
 
+url = os.getenv("MONGODB_ATLAS_URL")
+user = os.getenv("MONGODB_ATLAS_USER")
+pwd = os.getenv("MONGODB_ATLAS_PWD")
+
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 GENRES = ["adventure", "romance", "horror", "science fiction", "mystery", "satire",
           "historical fiction", "children's story", "poetry", "drama"]
@@ -64,15 +68,88 @@ def summarize_book(text):
 
 def upload_summary(key, summary, genre, job):
     """Add the summary and genre to the document with _id key in gutenberg.books, and add a run."""
-    # TODO: Part 1, Step 1 of README.md
-    raise NotImplementedError("upload_summary")
+    client = MongoClient(url, username=user, password=pwd, connectTimeoutMS=200, retryWrites=True) # use env variables to connect
+    logger.info("Connected to MongoDB Atlas")
+    try:
+        books = client["gutenberg"]["books"]
+        result = books.update_one(
+	   {"_id": key},
+	   {
+	      "$set": {
+		   "llm_analysis": {
+			# use function arguments for the subdocument
+			"summary": summary,
+			"genre": genre,
+			"model": MODEL,
+			"at": datetime.now(timezone.utc) # get the time now
+		   }
+	   	},
+	     "$push": {
+		   "runs": {
+			"host": socket.gethostname(),
+			"at": datetime.now(timezone.utc),
+			"job": job
+		   }
+		},
+	   }
+	)
+
+        if result.matched_count == 0: # when this is 0, there is no document with this _id value
+            logger.warning("No document for %s", key)
+
+    except PyMongoError as e:
+        logger.error("Failed to upload summary for %s: %s", key, e)
+        raise
+
+    finally:
+        client.close() # close connection
 
 
 def main():
     """Summarize book number TASK_ID of BOOK_LIST and save the result in MongoDB."""
-    # TODO: Part 1, Step 1 of README.md
-    raise NotImplementedError("main")
 
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s") # set up logging
+    
+    if len(sys.argv) != 3:
+        logger.error("Usage: summarize.py BOOK_LIST TASK_ID") # return a usage message if there aren't 2 arguments with the script call
+        sys.exit(1)
+     
+    book_list = sys.argv[1]
+    task_id = int(sys.argv[2]) # coerce the task_id argument to integer
+
+    with open(book_list, encoding="utf-8") as bk_ls:
+        books = [line.strip() for line in bk_ls if line.strip() and line.strip() != "File path"] # eliminate white space and empty lines (which would resolve to None), and exclude the header line
+
+    if not 1 <= task_id <= len(books): # ensure the task number is from 1 to the number of books
+        logger.error("Valid task ID range: 1-%s", len(books))
+        sys.exit(1)
+
+    path = books[task_id - 1] # task 1 is the first book, so it is at index task_id - 1
+    key = path.split("/")[-1] # get the file name from the absolute path
+    
+    logger.info("Task %s: %s", task_id, path)
+
+    text = read_book(path) 
+
+    start = time.time() # get the start time (right before calling the summarize_book(text) function)
+
+    summary, genre = summarize_book(text)
+
+    elapsed = time.time() - start # get the difference between current time and the start time to get elapsed time that it took to summarize the book
+
+    logger.info("%s: %s, %.1f s", key, genre, elapsed)
+
+    array_job = os.environ.get("SLURM_ARRAY_JOB_ID")
+    array_task = os.environ.get("SLURM_ARRAY_TASK_ID")
+
+    if array_job and array_task: # if the Slurm env variables are populated and not None
+        job = f"{array_job}_{array_task}" # merge into desired format
+    else:
+        job = None # there is no job if Slurm didn't assign the env variables
+
+    upload_summary(key, summary, genre, job)
+
+    logger.info("Summarized %s in %.1f s on %s", key, elapsed, socket.gethostname())
 
 if __name__ == "__main__":
     main()
